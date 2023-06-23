@@ -587,16 +587,6 @@ export class TEVMIndexer {
     }
 
     /*
-     * Wait until all db connector write tasks finish
-     */
-    async _waitWriteTasks() {
-        while (this.connector.writeCounter > 0) {
-            logger.debug(`waiting for ${this.connector.writeCounter} write operations to finish...`);
-            await sleep(200);
-        }
-    }
-
-    /*
      * Stop indexer gracefully
      */
     async stop() {
@@ -605,7 +595,7 @@ export class TEVMIndexer {
 
         clearInterval(this.statsTaskId);
 
-        await this._waitWriteTasks();
+        await this.connector._waitWriteJobs();
 
         process.exit(0);
     }
@@ -714,7 +704,7 @@ export class TEVMIndexer {
 
         logger.info(`got ${b.nativeBlockNumber} and expected ${this.lastNativeBlock}, chain fork detected. reverse all blocks which were affected`);
 
-        await this._waitWriteTasks();
+        await this.connector._waitWriteJobs();
 
         // finally purge db
         await this.connector.purgeNewerThan(

@@ -7,9 +7,16 @@ import {Client, estypes} from '@elastic/elasticsearch';
 import {StorageEosioDelta} from '../utils/evm.js';
 import { StorageEosioAction } from '../types/evm.js';
 
+import { Queue, Worker, QueueEvents } from 'bullmq';
+
 interface ConfigInterface {
     [key: string]: any;
 };
+
+interface JobData {
+    ops: any[];
+    blocks: any[];
+}
 
 function getSuffix(blockNum: number, docsPerIndex: number) {
     return String(Math.floor(blockNum / docsPerIndex)).padStart(8, '0');
@@ -29,13 +36,13 @@ export class Connector {
 
     state: IndexerState;
 
+    writeQueue: Queue<JobData>;
+    writerWorker: Worker;
     blockDrain: any[];
     opDrain: any[];
 
     totalPushed: number = 0;
     lastPushed: number = 0;
-
-    writeCounter: number = 0;
 
     constructor(config: IndexerConfig) {
         this.config = config;
@@ -43,6 +50,12 @@ export class Connector {
         this.elastic = new Client(config.elastic);
 
         this.broadcast = new RPCBroadcaster(config.broadcast);
+
+        this.writeQueue = new Queue<JobData>(`writeBlocks-${process.pid}`);
+        this.writerWorker = new Worker(`writeBlocks-${process.pid}`, async job => {
+            const { ops, blocks } = job.data;
+            await this.writeBlocks(ops, blocks);
+        });
 
         this.opDrain = [];
         this.blockDrain = [];
@@ -558,18 +571,45 @@ export class Connector {
         if (this.state == IndexerState.HEAD ||
             this.blockDrain.length >= this.config.perf.elasticDumpSize) {
 
-            const ops = this.opDrain;
-            const blocks = this.blockDrain;
+            this.writeQueue.add(`write-${currentEvmBlock}`, {
+                ops: this.opDrain,
+                blocks: this.blockDrain
+            });
 
             this.opDrain = [];
             this.blockDrain = [];
-            this.writeCounter++;
-
-            if (this.state == IndexerState.HEAD)
-                await this.writeBlocks(ops, blocks);
-            else
-                void this.writeBlocks(ops, blocks);
         }
+    }
+
+    async _waitWriteJobs(): Promise<void> {
+        // Get count of jobs in the queue.
+        const counts = await this.writeQueue.getJobCounts();
+        const total = counts.waiting + counts.active + counts.delayed + counts.paused;
+
+        if (total === 0) {
+            return;
+        }
+
+        // Create a promise that will resolve when all jobs are completed.
+        return new Promise((resolve, reject) => {
+            let completed = 0;
+
+            const queueEvents = new QueueEvents(this.writeQueue.name);
+
+            // Create a listener for the 'completed' event.
+            const listener = async () => {
+            completed += 1;
+
+            // If all jobs are completed, remove the listener and resolve the promise.
+            if (completed >= total) {
+                await queueEvents.close();
+                resolve();
+            }
+            };
+
+            // Add the listener to the queue events.
+            queueEvents.on('completed', listener);
+        });
     }
 
     forkCleanup(
@@ -651,8 +691,6 @@ export class Connector {
             this.broadcast.broadcastBlock(block);
 
         logger.info('done.');
-
-        this.writeCounter--;
 
         if (global.gc) {global.gc();}
     }

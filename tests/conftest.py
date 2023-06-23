@@ -97,9 +97,17 @@ def bootstrap_test_stack(
 
 
 @pytest.fixture(scope='session')
-def tevm_node(tmp_path_factory):
+def tevm_node_minimal(tmp_path_factory):
     with bootstrap_test_stack(
         tmp_path_factory, local.default_config, randomize=False) as tevmc:
+        yield tevmc
+
+@pytest.fixture(scope='session')
+def tevm_node(tmp_path_factory):
+    with bootstrap_test_stack(
+        tmp_path_factory, local.default_config, randomize=False
+        services=TEST_SERICES + ['nodeos']
+    ) as tevmc:
         yield tevmc
 
 
@@ -119,7 +127,7 @@ def stream_process_output(proc, message):
 
 
 @pytest.fixture
-def init_db_and_run_translator(tevm_node, request):
+def init_db_and_run_translator(tevm_node_minimal, request):
     docs_per_index = request.node.get_closest_marker("docs_per_index")
     if docs_per_index is None:
         docs_per_index = 10_000_000
@@ -169,9 +177,9 @@ def init_db_and_run_translator(tevm_node, request):
     else:
         message = message.args[0]
 
-    rpc_conf = tevm_node.config['telos-evm-rpc']
+    rpc_conf = tevm_node_minimal.config['telos-evm-rpc']
 
-    es_config = tevm_node.config['elasticsearch']
+    es_config = tevm_node_minimal.config['elasticsearch']
     es = Elasticsearch(
         f'{es_config["protocol"]}://{es_config["host"]}',
         basic_auth=(
