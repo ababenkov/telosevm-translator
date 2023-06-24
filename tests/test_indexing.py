@@ -1,23 +1,22 @@
+import os
+import threading
+import subprocess
 
-def test_indexing_mainnet(tevm_node):
-    env = {
-        'LOG_LEVEL': 'debug'
-    }
+from conftest import await_message_in_logs 
 
-    env.update(os.environ)
 
-    proc = subprocess.Popen(
-        ['node', 'build/main.js'],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        encoding='utf-8',
-        env=env
-    )
+def test_indexing_local(tevm_node):
+    await_message_in_logs(
+        'switched to HEAD mode!')
 
-    thread = threading.Thread(target=stream_process_output, args=(proc, message))
-    thread.start()
-    thread.join(timeout=timeout)
 
-    if thread.is_alive():
-        proc.terminate()
-        thread.join()  # ensure the process has terminated before raising the exception
-        raise ProcessTimeout(f"Process did not finish within {timeout} seconds")
+def test_indexing_mainnet(tevm_node_mainnet):
+    await_message_in_logs(
+        'switched to HEAD mode!',
+        timeout=60,
+        extra_env={
+            'CHAIN_ID': '40',
+            'TELOS_REMOTE_ENDPOINT': 'https://mainnet.telos.net',
+            'EVM_DEPLOY_BLOCK': '180698860',
+            'INDEXER_START_BLOCK': '180698860'
+        })

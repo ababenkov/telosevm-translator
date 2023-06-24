@@ -19,6 +19,7 @@ from elasticsearch import Elasticsearch
 from tevmc import TEVMController
 from tevmc.config import (
     local,
+    mainnet,
     build_docker_manifest,
     randomize_conf_ports,
     randomize_conf_creds,
@@ -30,7 +31,7 @@ from tevmc.cmdline.clean import clean
 from tevmc.cmdline.cli import get_docker_client
 
 
-TEST_SERVICES = ['elastic', 'kibana']
+TEST_SERVICES = ['redis', 'elastic', 'kibana']
 
 
 @contextmanager
@@ -102,11 +103,21 @@ def tevm_node_minimal(tmp_path_factory):
         tmp_path_factory, local.default_config, randomize=False) as tevmc:
         yield tevmc
 
+
 @pytest.fixture(scope='session')
 def tevm_node(tmp_path_factory):
     with bootstrap_test_stack(
-        tmp_path_factory, local.default_config, randomize=False
-        services=TEST_SERICES + ['nodeos']
+        tmp_path_factory, local.default_config, randomize=False,
+        services=TEST_SERVICES + ['nodeos']
+    ) as tevmc:
+        yield tevmc
+
+
+@pytest.fixture(scope='session')
+def tevm_node_mainnet(tmp_path_factory):
+    with bootstrap_test_stack(
+        tmp_path_factory, mainnet.default_config, randomize=False,
+        services=TEST_SERVICES + ['nodeos']
     ) as tevmc:
         yield tevmc
 
@@ -124,6 +135,35 @@ def stream_process_output(proc, message):
         logging.info(line.rstrip())
         if message in line:
             return
+
+
+def await_message_in_logs(
+    message: str,
+    timeout: float = 20,
+    extra_env: dict = {}
+):
+    env = {
+        'LOG_LEVEL': 'debug'
+    }
+
+    env.update(os.environ)
+    env.update(extra_env)
+
+    proc = subprocess.Popen(
+        ['node', 'build/main.js'],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding='utf-8',
+        env=env
+    )
+
+    thread = threading.Thread(target=stream_process_output, args=(proc, message))
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        proc.terminate()
+        thread.join()  # ensure the process has terminated before raising the exception
+        raise ProcessTimeout(f"Process did not finish within {timeout} seconds")
 
 
 @pytest.fixture
@@ -218,26 +258,6 @@ def init_db_and_run_translator(tevm_node_minimal, request):
 
     es.bulk(operations=ops, refresh=True)
 
-    env = {
-        'LOG_LEVEL': 'debug'
-    }
-
-    env.update(os.environ)
-
-    proc = subprocess.Popen(
-        ['node', 'build/main.js'],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        encoding='utf-8',
-        env=env
-    )
-
-    thread = threading.Thread(target=stream_process_output, args=(proc, message))
-    thread.start()
-    thread.join(timeout=timeout)
-
-    if thread.is_alive():
-        proc.terminate()
-        thread.join()  # ensure the process has terminated before raising the exception
-        raise ProcessTimeout(f"Process did not finish within {timeout} seconds")
+    await_message_in_logs(message, timeout)
 
     yield

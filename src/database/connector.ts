@@ -51,10 +51,31 @@ export class Connector {
 
         this.broadcast = new RPCBroadcaster(config.broadcast);
 
-        this.writeQueue = new Queue<JobData>(`writeBlocks-${process.pid}`);
+	const queueOpts = {
+            connection: config.redis,
+            defaultJobOptions: {
+		attempts: 3,
+                removeOnComplete: true
+            },
+        };
+
+        this.writeQueue = new Queue<JobData>(`writeBlocks-${process.pid}`, queueOpts);
+
+	const workerOpts = {
+	    blockingConnection: true,
+	    connection: config.redis,
+	    lockDuration: 5 * 60 * 1000  // five minutes
+	};
+
         this.writerWorker = new Worker(`writeBlocks-${process.pid}`, async job => {
             const { ops, blocks } = job.data;
             await this.writeBlocks(ops, blocks);
+        }, workerOpts);
+
+	const failureObserver = new QueueEvents(this.writeQueue.name, {connection: config.redis});
+	failureObserver.on('failed', ({ jobId, failedReason }) => {
+            logger.error(`Job ${jobId} failed with reason ${failedReason}`);
+	    process.exit(1);
         });
 
         this.opDrain = [];
@@ -571,6 +592,15 @@ export class Connector {
         if (this.state == IndexerState.HEAD ||
             this.blockDrain.length >= this.config.perf.elasticDumpSize) {
 
+	    // check if queue is backed up and wait for it to get cleared
+	    const counts =  await this.writeQueue.getJobCounts();
+	    const total = counts.waiting + counts.active + counts.delayed + counts.paused;
+	    if (total >= this.config.elastic.queueBackpressure) {
+		logger.warn(`write queue is backed up... awaiting current jobs to finish before new enqueue...`);
+		logger.warn(`queue stats: ${JSON.stringify(counts)}`);
+		await this._waitWriteJobs();
+	    }
+
             this.writeQueue.add(`write-${currentEvmBlock}`, {
                 ops: this.opDrain,
                 blocks: this.blockDrain
@@ -582,34 +612,12 @@ export class Connector {
     }
 
     async _waitWriteJobs(): Promise<void> {
-        // Get count of jobs in the queue.
-        const counts = await this.writeQueue.getJobCounts();
-        const total = counts.waiting + counts.active + counts.delayed + counts.paused;
-
-        if (total === 0) {
-            return;
+	let total = 1;
+        while (total > 0) {
+            const counts = await this.writeQueue.getJobCounts();
+	    total = counts.waiting + counts.active + counts.delayed + counts.paused;
+	    await new Promise(resolve => setTimeout(resolve, 200));
         }
-
-        // Create a promise that will resolve when all jobs are completed.
-        return new Promise((resolve, reject) => {
-            let completed = 0;
-
-            const queueEvents = new QueueEvents(this.writeQueue.name);
-
-            // Create a listener for the 'completed' event.
-            const listener = async () => {
-            completed += 1;
-
-            // If all jobs are completed, remove the listener and resolve the promise.
-            if (completed >= total) {
-                await queueEvents.close();
-                resolve();
-            }
-            };
-
-            // Add the listener to the queue events.
-            queueEvents.on('completed', listener);
-        });
     }
 
     forkCleanup(

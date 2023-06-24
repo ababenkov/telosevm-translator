@@ -41,6 +41,11 @@ import {
     TxDeserializationError
 } from "./handlers.js";
 
+import cron from 'node-cron';
+
+import { Queue, Worker, QueueEvents } from 'bullmq';
+
+const nfObject = new Intl.NumberFormat('en-US');
 
 process.on('unhandledRejection', error => {
     logger.error('Unhandled Rejection');
@@ -87,14 +92,16 @@ export class TEVMIndexer {
     lastNativeBlock: number;  // last native block number that was succesfully pushed to db in order
 
     // debug status used to print statistics
-    private pushedLastSecond: number = 0;
-
-    private statsTaskId: NodeJS.Timer;
+    private pushedLastUpdate: number = 0;
+    private timestampLastUpdate: number = 0;
 
     private limboBuffs: InprogressBuffers = null;
     private irreversibleOnly: boolean;
 
     private latestBlockHashes: Array<{blockNum: number, hash: string}> = [];
+
+    private blocksQueue: Queue<any>;
+    private blocksWorker: Worker;
 
     constructor(telosConfig: IndexerConfig) {
         this.config = telosConfig;
@@ -119,22 +126,52 @@ export class TEVMIndexer {
         //     process.on('SIGUSR1', async () => logWhyIsNodeRunning());
 
         setCommon(telosConfig.chainId);
+
+	const queueOpts = {
+            connection: this.config.redis,
+            defaultJobOptions: {
+		attempts: 3,
+                removeOnComplete: true
+            },
+        };
+
+        this.blocksQueue = new Queue<any>(`blocks-${process.pid}`, queueOpts);
+
+	const workerOpts = {
+	    // blockingConnection: true,
+	    connection: this.config.redis
+	};
+
+        this.blocksWorker = new Worker(this.blocksQueue.name, async job => {
+            await this.processBlock(job.data);
+        }, workerOpts);
+
+	const failureObserver = new QueueEvents(this.blocksQueue.name, {connection: this.config.redis});
+	failureObserver.on('failed', ({ jobId, failedReason }) => {
+            logger.error(`Job ${jobId} failed with reason ${failedReason}`);
+	    process.exit(1);
+        });
     }
 
     /*
      * Debug routine that prints indexing stats, periodically called every second
      */
     updateDebugStats() {
-        let statsString = `${formatBlockNumbers(this.lastNativeBlock, this.lastBlock)} pushed, at ${this.pushedLastSecond} blocks/sec`;
+	const now = Date.now() / 1000;
+	const elapsed = now - this.timestampLastUpdate;
+	const blocksPerSecond = this.pushedLastUpdate / elapsed;
+
+        let statsString = `${formatBlockNumbers(this.lastNativeBlock, this.lastBlock)} pushed, at ${nfObject.format(blocksPerSecond)} blocks/sec`;
         const untilHead = this.headBlock - this.lastNativeBlock;
 
         if (untilHead > 3) {
-            const hoursETA = `${((untilHead / this.pushedLastSecond) / (60 * 60)).toFixed(1)}hs`;
-            statsString += `, ${untilHead} to reach head, aprox ${hoursETA}`;
+            const hoursETA = `${((untilHead / blocksPerSecond) / (60 * 60)).toFixed(1)}hs`;
+            statsString += `, ${nfObject.format(untilHead)} to reach head, aprox ${hoursETA}`;
         }
 
         logger.info(statsString);
-        this.pushedLastSecond = 0;
+        this.pushedLastUpdate = 0;
+	this.timestampLastUpdate = now;
     }
 
     /*
@@ -236,10 +273,8 @@ export class TEVMIndexer {
 
         // SYNC & HEAD mode swtich detection
         try {
-            const remoteHead = (await this.remoteRpc.get_info()).head_block_num;
-            const blocksUntilHead = remoteHead - this.lastBlock;
-
-            logger.info(`${blocksUntilHead} until remote head ${remoteHead}`);
+            this.headBlock = (await this.remoteRpc.get_info()).head_block_num;
+            const blocksUntilHead = this.headBlock - this.lastBlock;
 
             if (blocksUntilHead <= 100) {
                 this.state = IndexerState.HEAD;
@@ -435,7 +470,7 @@ export class TEVMIndexer {
         this.lastNativeBlock = storableBlockInfo.delta.block_num;
 
         // For debug stats
-        this.pushedLastSecond++;
+        this.pushedLastUpdate++;
 
         this.reader.ack();
     }
@@ -500,7 +535,13 @@ export class TEVMIndexer {
             throw new Error(
                 'Looks like local node doesn\'t have start_block on blocks log');
 
-        setInterval(() => this.handleStateSwitch(), 10 * 1000);
+	cron.schedule('*/5 * * * * *', () => {
+	    this.updateDebugStats();
+	});
+
+	cron.schedule('*/10 * * * * *', () => {
+	    this.handleStateSwitch();
+	});
 
         this.reader = new HyperionSequentialReader({
             poolSize: this.config.perf.workerAmount,
@@ -522,16 +563,17 @@ export class TEVMIndexer {
             logger.error(`SHIP Reader error: ${err}`);
         }
 
-        this.reader.events.on('block', this.processBlock.bind(this));
+        this.reader.events.on('block', (data) => {
+	    this.blocksQueue.add(
+		`block-${data.blockInfo.this_block.block_num}`, data);
+	});
 
         ['eosio', 'eosio.token', 'eosio.msig', 'eosio.evm'].forEach(c => {
             const abi = ABI.from(JSON.parse(readFileSync(`src/abis/${c}.json`).toString()));
             this.reader.addContract(c, abi);
         })
         this.reader.start();
-
-        // Launch bg routines
-        this.statsTaskId = setInterval(() => this.updateDebugStats(), 1000);
+	this.timestampLastUpdate = Date.now() / 1000;
     }
 
     async genesisBlockInitialization(evmGenesisBlock: number) {
@@ -593,11 +635,18 @@ export class TEVMIndexer {
         // if (process.env.LOG_LEVEL == 'debug')
         //     logWhyIsNodeRunning();
 
-        clearInterval(this.statsTaskId);
+	logger.info(`Stopping indexer...`);
 
+	if (this.reader)
+	    this.reader.ship.close();
+		
         await this.connector._waitWriteJobs();
 
-        process.exit(0);
+	logger.on('finish', () => {
+            process.exit(0);
+        });
+
+	logger.end();
     }
 
     /*

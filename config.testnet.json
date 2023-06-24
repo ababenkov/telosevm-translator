@@ -17,6 +17,11 @@
         "elasticDumpSize": 2048
     },
 
+    "redis": {
+	"host": "127.0.0.1",
+	"port": 6379
+    },
+
     "elastic": {
         "node": "http://127.0.0.1:9200",
         "auth": {
@@ -24,6 +29,7 @@
             "password": "password"
         },
         "docsPerIndex": 10000000,
+	"queueBackpressure": 3,
         "subfix": {
             "delta": "delta-v1.5",
             "transaction": "action-v1.5",

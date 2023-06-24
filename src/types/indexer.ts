@@ -2,6 +2,11 @@ import {TxDeserializationError} from '../handlers.js';
 import {StorageEosioAction} from './evm.js';
 import {StorageEosioDelta} from '../utils/evm.js';
 
+export type RedisConnectionConfig = {
+    host: string;
+    port: number;
+}
+
 export type ConnectorConfig = {
     node: string;
     auth: {
@@ -9,6 +14,7 @@ export type ConnectorConfig = {
         password: string;
     },
     docsPerIndex: number,
+    queueBackpressure: number,
     subfix: {
         delta: string;
         error: string;
@@ -37,6 +43,7 @@ export type IndexerConfig = {
         workerAmount: number;
         elasticDumpSize: number;
     },
+    redis: RedisConnectionConfig,
     elastic: ConnectorConfig;
     broadcast: BroadcasterConfig;
 };
@@ -60,6 +67,11 @@ export const DEFAULT_CONF = {
         "elasticDumpSize": 2048
     },
 
+    "redis": {
+	"host": "127.0.0.1",
+	"port": 6379
+    },
+
     "elastic": {
         "node": "http://127.0.0.1:9200",
         "auth": {
@@ -67,6 +79,7 @@ export const DEFAULT_CONF = {
             "password": "password"
         },
         "docsPerIndex": 10000000,
+	"queueBackpressure": 3,
         "subfix": {
             "delta": "delta-v1.5",
             "transaction": "action-v1.5",
